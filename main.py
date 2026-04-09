@@ -178,10 +178,7 @@ def analyze_image_base64(image_base64: Optional[str], width: int, height: int) -
         "imageQuality": "unknown"
     }
 
-    if not image_base64:
-        return result
-
-    if not PIL_AVAILABLE:
+    if not image_base64 or not PIL_AVAILABLE:
         return result
 
     try:
@@ -542,17 +539,7 @@ def infer_action(market: Dict[str, Any], timing: Dict[str, Any], context: Dict[s
     )
 
 
-def build_action(
-    signal: str,
-    action: str,
-    status: str,
-    instruction: str,
-    confidence: int,
-    risk: str,
-    continuation: int,
-    reversal: int,
-    explanation: str
-) -> Dict[str, Any]:
+def build_action(signal: str, action: str, status: str, instruction: str, confidence: int, risk: str, continuation: int, reversal: int, explanation: str) -> Dict[str, Any]:
     return {
         "signal": signal,
         "action": action,
@@ -614,14 +601,7 @@ def parse_mmss_to_seconds(value: str) -> Optional[int]:
 
 
 def timeframe_to_seconds(timeframe: str) -> int:
-    mapping = {
-        "M1": 60,
-        "M2": 120,
-        "M3": 180,
-        "M5": 300,
-        "M10": 600,
-        "M15": 900
-    }
+    mapping = {"M1": 60, "M2": 120, "M3": 180, "M5": 300, "M10": 600, "M15": 900}
     return mapping.get(timeframe.upper(), 60)
 
 
@@ -654,5 +634,5 @@ def optional_int(value: Any) -> Optional[int]:
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
