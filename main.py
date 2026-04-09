@@ -49,10 +49,35 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 payload = json.loads(raw)
             except Exception:
-                await websocket.send_text(json.dumps(build_error_response("JSON inválido")))
+                error_response = build_error_response("JSON inválido")
+                print("JSON inválido recebido")
+                await websocket.send_text(json.dumps(error_response))
                 continue
 
+            print("Payload recebido:", {
+                "comando": payload.get("comando"),
+                "width": payload.get("width"),
+                "height": payload.get("height"),
+                "hasImage": bool(payload.get("imageBase64")),
+                "timeframe": payload.get("timeframe"),
+                "clock": payload.get("chartClock"),
+                "candle": payload.get("candleTimeRemaining"),
+                "price": payload.get("currentPrice"),
+                "asset": payload.get("asset"),
+            })
+
             response = process_payload(payload)
+
+            print("Resposta enviada:", {
+                "sinal": response.get("sinal"),
+                "action": response.get("action"),
+                "status": response.get("status"),
+                "confidence": response.get("confidence"),
+                "risk": response.get("risk"),
+                "entryTiming": response.get("entryTiming"),
+                "secondsToAction": response.get("secondsToAction"),
+            })
+
             await websocket.send_text(json.dumps(response))
 
     except WebSocketDisconnect:
@@ -173,7 +198,6 @@ def analyze_image_base64(image_base64: Optional[str], width: int, height: int) -
         green = 0
         red = 0
         active = 0
-        total = len(pixels)
 
         for r, g, b in pixels:
             brightness = (r + g + b) / 3
@@ -216,7 +240,8 @@ def analyze_image_base64(image_base64: Optional[str], width: int, height: int) -
         })
         return result
 
-    except Exception:
+    except Exception as e:
+        print("Erro ao analisar imagem:", e)
         return result
 
 
