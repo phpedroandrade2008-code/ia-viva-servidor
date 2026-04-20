@@ -3,7 +3,8 @@ import io
 import json
 import math
 import time
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -11,7 +12,26 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageStat
 
-app = FastAPI(title="ChartLens Railway", version="2.0.0")
+APP_VERSION = "3.0.0"
+WS_PATH = "/ws/sinais"
+
+
+# =========================================================
+# APP / LIFESPAN
+# =========================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.started_at = time.time()
+    app.state.service_name = "chartlens-railway"
+    yield
+
+
+app = FastAPI(
+    title="ChartLens Railway",
+    version=APP_VERSION,
+    lifespan=lifespan,
+)
 
 
 # =========================================================
@@ -29,7 +49,7 @@ class ParsedContext:
     timeframe: str = ""
     payout_percent: Optional[int] = None
     selected_operation_sec: Optional[int] = None
-    warnings: Optional[list[str]] = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -172,8 +192,7 @@ def default_operation_sec_for_timeframe(tf: str) -> int:
 def operation_label(sec: Optional[int]) -> str:
     sec = sec or 60
     if sec % 60 == 0:
-        minutes = sec // 60
-        return f"{minutes} min"
+        return f"{sec // 60} min"
     return f"{sec}s"
 
 
@@ -193,21 +212,26 @@ def is_forex_like(asset: str) -> bool:
 def price_reliable_for_asset(asset: str, value: Optional[float], raw: str) -> bool:
     if value is None:
         return False
+
     clean = safe_str(raw).replace(" ", "").replace(",", ".")
     if "." not in clean:
         return False
 
-    int_digits = len(clean.split(".")[0].replace("-", ""))
-    dec_digits = len(clean.split(".")[1]) if "." in clean else 0
+    parts = clean.split(".")
+    if len(parts) != 2:
+        return False
+
+    int_digits = len(parts[0].replace("-", ""))
+    dec_digits = len(parts[1])
     asset_up = asset.upper()
 
     if dec_digits < 2 or dec_digits > 6:
         return False
 
     if "BTC" in asset_up:
-        return int_digits >= 4
+        return int_digits >= 4 and 1000.0 <= value <= 200000.0
     if "ETH" in asset_up:
-        return int_digits >= 3
+        return int_digits >= 3 and 100.0 <= value <= 20000.0
     if "XRP" in asset_up or "ADA" in asset_up:
         return 0.05 <= value <= 10.0
     if "DOGE" in asset_up:
@@ -219,6 +243,13 @@ def price_reliable_for_asset(asset: str, value: Optional[float], raw: str) -> bo
     if not asset_up:
         return 0.01 <= value <= 100000.0
     return value > 0
+
+
+def normalize_outcome_action(action: str) -> str:
+    value = safe_str(action).upper()
+    if not value:
+        return "WAIT"
+    return value
 
 
 # =========================================================
@@ -272,7 +303,6 @@ def extract_context(payload: Dict[str, Any]) -> ParsedContext:
         or payload.get("operationSec")
         or payload.get("duracao")
     )
-
     if selected_operation_sec is None:
         selected_operation_sec = default_operation_sec_for_timeframe(timeframe)
 
@@ -667,9 +697,9 @@ def confidence_from_context(ctx: ParsedContext, img: ImageAnalysis) -> int:
     if ctx.payout_percent is not None:
         confidence += 2
 
-    if "price_unreliable" in (ctx.warnings or []):
+    if "price_unreliable" in ctx.warnings:
         confidence -= 8
-    if "candle_time_invalid" in (ctx.warnings or []):
+    if "candle_time_invalid" in ctx.warnings:
         confidence -= 6
     if img.quality_label == "weak":
         confidence -= 8
@@ -684,7 +714,7 @@ def risk_from_context(ctx: ParsedContext, img: ImageAnalysis) -> str:
     score += img.fake_move_risk * 0.34
     score += img.structural_weakness * 0.28
     score += img.reversal_pressure * 0.22
-    if "price_unreliable" in (ctx.warnings or []):
+    if "price_unreliable" in ctx.warnings:
         score += 0.18
     if ctx.payout_percent is not None and ctx.payout_percent < 70:
         score += 0.12
@@ -939,7 +969,7 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     explanation = build_explanation(ctx, img, decision, timing, confidence, risk)
     short_message = build_short_message(decision, img)
 
-    response = {
+    return {
         "ok": True,
         "source": "railway",
         "serverTimestamp": now_iso(),
@@ -955,7 +985,7 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         "marketState": market_state(img),
         "nextMovePrediction": next_move_prediction(img),
 
-        "action": decision["action"],
+        "action": normalize_outcome_action(decision["action"]),
         "instruction": decision["instruction"],
         "entryTiming": timing["entryTiming"],
         "secondsToAction": timing["secondsToAction"],
@@ -989,7 +1019,7 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         "imageQuality": img.quality_label,
         "imageNotes": img.notes,
-        "contextWarnings": ctx.warnings or [],
+        "contextWarnings": ctx.warnings,
 
         "debug": {
             "imageOk": img.image_ok,
@@ -1007,8 +1037,6 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
-    return response
-
 
 # =========================================================
 # ROTAS
@@ -1016,33 +1044,39 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.get("/")
 async def root():
+    uptime_sec = int(time.time() - app.state.started_at)
     return JSONResponse({
         "ok": True,
-        "service": "chartlens-railway",
-        "version": "2.0.0",
+        "service": app.state.service_name,
+        "version": APP_VERSION,
         "status": "online",
         "timestamp": now_iso(),
-        "ws": "/ws/sinais",
+        "uptimeSec": uptime_sec,
+        "ws": WS_PATH,
     })
 
 
 @app.get("/health")
 async def health():
+    uptime_sec = int(time.time() - app.state.started_at)
     return {
         "ok": True,
         "status": "healthy",
+        "service": app.state.service_name,
+        "version": APP_VERSION,
         "timestamp": now_iso(),
+        "uptimeSec": uptime_sec,
     }
 
 
-@app.websocket("/ws/sinais")
+@app.websocket(WS_PATH)
 async def ws_sinais(websocket: WebSocket):
     await websocket.accept()
 
     await websocket.send_text(json.dumps({
         "ok": True,
         "type": "connected",
-        "message": "Cliente conectado no /ws/sinais",
+        "message": f"Cliente conectado no {WS_PATH}",
         "serverTimestamp": now_iso(),
     }))
 
@@ -1053,6 +1087,8 @@ async def ws_sinais(websocket: WebSocket):
 
             try:
                 payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON precisa ser objeto")
             except Exception:
                 await websocket.send_text(json.dumps({
                     "ok": False,
