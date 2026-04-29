@@ -11,7 +11,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageStat
 
-APP_VERSION = "4.0.0-tradingview-paper"
+APP_VERSION = "4.1.0-tradingview-no-hard-block"
 WS_PATH = "/ws/sinais"
 
 
@@ -412,8 +412,6 @@ def normalize_action(action: str) -> str:
     if not value:
         return "WAIT"
 
-    if "WAIT_ORDER_PANEL" in value:
-        return "WAIT_ORDER_PANEL"
     if "DATA_INSUFFICIENT" in value or "INSUFFICIENT" in value:
         return "DATA_INSUFFICIENT"
     if "WAIT_ONE_MORE_CANDLE" in value or "WAIT_NEXT_CANDLE" in value:
@@ -426,6 +424,8 @@ def normalize_action(action: str) -> str:
         return "WAIT_STRUCTURE"
     if "WAIT_RISK" in value:
         return "WAIT_RISK"
+    if "WAIT_ORDER_PANEL" in value:
+        return "WAIT"
 
     if value in ("BUY", "BUY_NOW", "CALL") or "COMPRAR" in value or "COMPRA" in value:
         return "BUY"
@@ -452,14 +452,6 @@ def normalize_risk(value: str) -> str:
         return "low"
 
     return "medium"
-
-
-def risk_rank(value: str) -> int:
-    return {
-        "low": 1,
-        "medium": 2,
-        "high": 3,
-    }.get(normalize_risk(value), 2)
 
 
 # =========================================================
@@ -553,14 +545,12 @@ def extract_context(payload: Dict[str, Any]) -> ParsedContext:
         order_panel_open = contains_any(
             text,
             [
-                "ORDER_PANEL_OPEN",
-                "WAIT_ORDER_PANEL",
-                "PAINEL DE ORDEM",
-                "PAINEL ABERTO",
                 "TAKE PROFIT",
                 "STOP LOSS",
                 "TEMPO EM VIGOR",
                 "UNIDADES",
+                "ORDEM DE MERCADO",
+                "PAINEL DE ORDEM",
             ],
         )
 
@@ -569,19 +559,17 @@ def extract_context(payload: Dict[str, Any]) -> ParsedContext:
         blocking_popup = contains_any(
             text,
             [
-                "BLOCKING_POPUP",
-                "BLOCKED_POPUP",
-                "SCREEN_BLOCKED",
-                "TELA BLOQUEADA",
-                "KYC",
-                "LOGIN",
-                "SENHA",
-                "VERIFICACAO",
-                "VERIFICAÇÃO",
+                "PEDIDO REJEITADO",
+                "CONCLUA A ATUALIZACAO",
+                "CONCLUA A ATUALIZAÇÃO",
+                "ATUALIZACAO DO KYC",
+                "ATUALIZAÇÃO DO KYC",
+                "VERIFICACAO DE IDENTIDADE",
+                "VERIFICAÇÃO DE IDENTIDADE",
                 "DOCUMENTO",
                 "SEM CONEXAO",
                 "SEM CONEXÃO",
-                "PEDIDO REJEITADO",
+                "SUPORTE AO CLIENTE",
             ],
         )
 
@@ -590,13 +578,14 @@ def extract_context(payload: Dict[str, Any]) -> ParsedContext:
         paper_trading = contains_any(text, ["PAPER TRADING", "PAPER", "SIMULADOR", "CONTA DEMO"])
 
     market_view_mode = safe_str(payload.get("marketViewMode") or payload.get("viewMode"))
-    screen_status = safe_str(payload.get("screenStatus") or payload.get("status"))
 
-    minimum_context_ok = bool(asset and current_price_raw and timeframe)
+    minimum_context_ok = bool(asset and timeframe)
 
-    chart_readable = chart_readable_payload
-    if chart_readable is None:
-        chart_readable = minimum_context_ok and not order_panel_open and not blocking_popup
+    chart_readable = minimum_context_ok
+    if chart_readable_payload is False and minimum_context_ok:
+        warnings.append("chart_readable_false_ignored")
+    if chart_readable_payload is True:
+        chart_readable = True
 
     if not asset:
         warnings.append("asset_missing")
@@ -616,25 +605,24 @@ def extract_context(payload: Dict[str, Any]) -> ParsedContext:
         warnings.append("timeframe_missing")
 
     if order_panel_open:
-        warnings.append("order_panel_open")
+        warnings.append("order_panel_warning_not_blocking")
 
     if blocking_popup:
-        warnings.append("blocking_popup")
+        warnings.append("popup_warning_not_blocking")
 
     if not chart_readable:
         warnings.append("chart_not_readable")
 
-    if not screen_status:
-        if blocking_popup:
-            screen_status = "blocked_popup"
-        elif order_panel_open:
-            screen_status = "order_panel_open"
-        elif not minimum_context_ok:
-            screen_status = "insufficient_context"
-        elif not chart_readable:
-            screen_status = "chart_not_readable"
-        else:
+    screen_status = safe_str(payload.get("screenStatus") or payload.get("status"))
+    if not screen_status or screen_status in ("blocked_popup", "order_panel_open", "chart_not_readable"):
+        if chart_readable and order_panel_open:
+            screen_status = "chart_readable_order_panel_warning"
+        elif chart_readable and blocking_popup:
+            screen_status = "chart_readable_popup_warning"
+        elif chart_readable:
             screen_status = "chart_readable"
+        else:
+            screen_status = "insufficient_context"
 
     return ParsedContext(
         asset=asset,
@@ -837,9 +825,9 @@ def analyze_image(image: Optional[Image.Image]) -> ImageAnalysis:
             trend_score=0.0,
             micro_score=0.0,
             breakout_score=0.0,
-            fake_move_risk=0.75,
-            structural_weakness=0.75,
-            reversal_pressure=0.50,
+            fake_move_risk=0.55,
+            structural_weakness=0.55,
+            reversal_pressure=0.35,
             continuation_health=0.20,
             detected_pattern="unclear_pattern",
             quality_label="no_image",
@@ -1071,7 +1059,7 @@ def infer_timing(candle_sec: Optional[int], chart_base_sec: int, timeframe: str)
 
 
 def confidence_from_context(ctx: ParsedContext, img: ImageAnalysis) -> int:
-    confidence = 48
+    confidence = 52
 
     if img.image_ok:
         confidence += int(img.strength_score * 22)
@@ -1079,57 +1067,57 @@ def confidence_from_context(ctx: ParsedContext, img: ImageAnalysis) -> int:
         confidence += int((1.0 - img.fake_move_risk) * 8)
 
     if ctx.asset:
-        confidence += 3
+        confidence += 4
 
     if ctx.current_price_raw and price_reliable_for_asset(ctx.asset, ctx.current_price_value, ctx.current_price_raw):
-        confidence += 5
+        confidence += 4
 
     if ctx.chart_clock:
         confidence += 2
 
     if ctx.timeframe:
-        confidence += 3
+        confidence += 4
 
     if ctx.candle_time_remaining_sec is not None:
         confidence += 4
 
     if ctx.paper_trading:
-        confidence += 2
+        confidence += 1
 
     if ctx.chart_readable:
-        confidence += 5
+        confidence += 4
 
     if "price_unreliable" in ctx.warnings:
-        confidence -= 8
+        confidence -= 3
 
     if "candle_time_invalid" in ctx.warnings:
-        confidence -= 6
+        confidence -= 3
 
     if "timeframe_missing" in ctx.warnings:
-        confidence -= 7
+        confidence -= 12
 
     if "asset_missing" in ctx.warnings:
-        confidence -= 7
+        confidence -= 12
 
     if "price_missing" in ctx.warnings:
-        confidence -= 8
+        confidence -= 2
 
     if ctx.order_panel_open:
-        confidence -= 18
+        confidence -= 2
 
     if ctx.blocking_popup:
-        confidence -= 24
+        confidence -= 2
 
     if not ctx.chart_readable:
         confidence -= 10
 
     if img.quality_label == "weak":
-        confidence -= 8
-
-    if img.dominant_bias == "neutral":
         confidence -= 6
 
-    return int(clamp(confidence, 8, 95))
+    if img.dominant_bias == "neutral":
+        confidence -= 5
+
+    return int(clamp(confidence, 12, 95))
 
 
 def risk_from_context(ctx: ParsedContext, img: ImageAnalysis) -> str:
@@ -1139,24 +1127,24 @@ def risk_from_context(ctx: ParsedContext, img: ImageAnalysis) -> str:
     score += img.reversal_pressure * 0.22
 
     if "price_unreliable" in ctx.warnings:
-        score += 0.16
+        score += 0.04
 
     if "candle_time_invalid" in ctx.warnings:
-        score += 0.08
+        score += 0.04
 
     if ctx.order_panel_open:
-        score += 0.35
+        score += 0.05
 
     if ctx.blocking_popup:
-        score += 0.45
+        score += 0.05
 
     if not ctx.chart_readable:
-        score += 0.18
+        score += 0.12
 
-    if score >= 0.68:
+    if score >= 0.70:
         return "high"
 
-    if score >= 0.42:
+    if score >= 0.44:
         return "medium"
 
     return "low"
@@ -1169,37 +1157,23 @@ def infer_action(ctx: ParsedContext, img: ImageAnalysis, timing: Dict[str, Any],
     continuation_prob = int(clamp(img.continuation_health * 100, 0, 100))
     reversal_prob = int(clamp(img.reversal_pressure * 100, 0, 100))
 
-    minimum_context = bool(ctx.asset and ctx.timeframe and ctx.current_price_raw)
+    minimum_context = bool(ctx.asset and ctx.timeframe)
 
-    if ctx.blocking_popup:
+    if not minimum_context:
         action = "DATA_INSUFFICIENT"
-        instruction = "Tela bloqueada • feche aviso/popup"
-        trigger = "Fechar popup, login, KYC ou aviso antes de analisar"
-        invalidation = "Enquanto houver aviso cobrindo o gráfico"
-        reason = "tela_bloqueada"
-        main_text = "Tela bloqueada por popup/aviso."
-    elif ctx.order_panel_open:
-        action = "WAIT_ORDER_PANEL"
-        instruction = "Painel aberto • feche para analisar"
-        trigger = "Fechar painel de ordem antes de confiar nos candles"
-        invalidation = "Enquanto o painel cobrir parte do gráfico"
-        reason = "painel_de_ordem_aberto"
-        main_text = "Painel de ordem aberto."
-    elif not minimum_context:
-        action = "DATA_INSUFFICIENT"
-        instruction = "Dados insuficientes para entrada"
-        trigger = "Confirmar ativo, preço e timeframe"
-        invalidation = "Se continuar sem contexto confiável"
+        instruction = "Dados mínimos ausentes"
+        trigger = "Confirmar ativo e timeframe no TradingView"
+        invalidation = "Enquanto ativo/timeframe não forem detectados"
         reason = "contexto_minimo_insuficiente"
-        main_text = "Ainda faltam dados essenciais do TradingView."
-    elif not ctx.chart_readable:
-        action = "DATA_INSUFFICIENT"
-        instruction = "Gráfico não confiável"
-        trigger = "Deixar gráfico limpo em candles"
-        invalidation = "Se o gráfico continuar ilegível"
-        reason = "grafico_nao_confiavel"
-        main_text = "A tela ainda não está confiável."
-    elif risk == "high" and confidence < 74:
+        main_text = "Falta ativo ou timeframe para analisar com segurança."
+    elif not img.image_ok:
+        action = "WAIT"
+        instruction = "Aguardando imagem do gráfico"
+        trigger = "Manter TradingView aberto com candles visíveis"
+        invalidation = "Se a captura não enviar frame"
+        reason = "imagem_indisponivel"
+        main_text = "Contexto básico existe, mas a imagem do gráfico não chegou."
+    elif risk == "high" and confidence < 58:
         action = "WAIT_RISK"
         instruction = "Risco alto • aguardar"
         trigger = "Aguardar cenário mais limpo"
@@ -1213,21 +1187,21 @@ def infer_action(ctx: ParsedContext, img: ImageAnalysis, timing: Dict[str, Any],
         invalidation = "Se a próxima vela também vier sem confirmação"
         reason = "janela_tardia"
         main_text = "A janela desta vela ficou tardia."
-    elif img.fake_move_risk >= 0.70:
+    elif img.fake_move_risk >= 0.76:
         action = "WAIT_RISK"
         instruction = "Movimento suspeito • aguardar"
         trigger = "Confirmar rompimento/continuação real antes de agir"
         invalidation = "Se houver pavio forte contra a direção"
         reason = "falso_movimento"
         main_text = "Há risco de armadilha ou falso rompimento."
-    elif img.structural_weakness >= 0.66:
+    elif img.structural_weakness >= 0.74:
         action = "WAIT_STRUCTURE"
         instruction = "Estrutura fraca • aguardar"
         trigger = "Esperar estrutura mais limpa"
         invalidation = "Se a estrutura continuar ruidosa ou lateral"
         reason = "estrutura_fraca"
         main_text = "A estrutura ainda está fraca."
-    elif img.reversal_pressure >= 0.70:
+    elif img.reversal_pressure >= 0.78:
         action = "WAIT_RISK"
         instruction = "Risco de reversão • aguardar"
         trigger = "Esperar confirmação da direção dominante"
@@ -1242,16 +1216,16 @@ def infer_action(ctx: ParsedContext, img: ImageAnalysis, timing: Dict[str, Any],
             invalidation = "Se perder força compradora"
             reason = "setup_comprador_em_formacao"
             main_text = "Compra em preparação."
-        elif timing_quality == "late_warning" and confidence < 84:
+        elif timing_quality == "late_warning" and confidence < 78:
             action = "WAIT_BUY_SETUP"
             instruction = "Compra tardia • exigir confirmação forte"
-            trigger = "Comprar só se a força compradora continuar muito clara"
+            trigger = "Comprar só se a força compradora continuar clara"
             invalidation = "Se aparecer rejeição contra compra"
             reason = "compra_quase_tardia"
             main_text = "Compra possível, mas timing já está ficando tarde."
         else:
             action = "BUY"
-            instruction = "Comprar • Paper/TradingView"
+            instruction = "Comprar • TradingView/BingX manual"
             trigger = "Comprar enquanto a direção compradora seguir firme"
             invalidation = "Se aparecer rejeição forte contra a compra"
             reason = "entrada_compradora"
@@ -1264,16 +1238,16 @@ def infer_action(ctx: ParsedContext, img: ImageAnalysis, timing: Dict[str, Any],
             invalidation = "Se perder força vendedora"
             reason = "setup_vendedor_em_formacao"
             main_text = "Venda em preparação."
-        elif timing_quality == "late_warning" and confidence < 84:
+        elif timing_quality == "late_warning" and confidence < 78:
             action = "WAIT_SELL_SETUP"
             instruction = "Venda tardia • exigir confirmação forte"
-            trigger = "Vender só se a força vendedora continuar muito clara"
+            trigger = "Vender só se a força vendedora continuar clara"
             invalidation = "Se aparecer rejeição contra venda"
             reason = "venda_quase_tardia"
             main_text = "Venda possível, mas timing já está ficando tarde."
         else:
             action = "SELL"
-            instruction = "Vender • Paper/TradingView"
+            instruction = "Vender • TradingView/BingX manual"
             trigger = "Vender enquanto a direção vendedora seguir firme"
             invalidation = "Se aparecer rejeição forte contra a venda"
             reason = "entrada_vendedora"
@@ -1317,13 +1291,15 @@ def build_explanation(
     parts = []
 
     parts.append(decision["main_text"])
-    parts.append("Modo TradingView/Paper Trading com payout ignorado.")
+    parts.append("Modo TradingView/BingX com payout ignorado e sem bloqueio imediato por popup/painel.")
 
     if ctx.asset:
         parts.append(f"Ativo {ctx.asset}.")
 
     if ctx.current_price_raw:
         parts.append(f"Preço {ctx.current_price_raw}.")
+    else:
+        parts.append("Preço ausente apenas como aviso, sem bloquear candles.")
 
     if ctx.timeframe:
         parts.append(f"Timeframe {ctx.timeframe}.")
@@ -1360,8 +1336,8 @@ def build_explanation(
     parts.append(
         f"Tela {ctx.screen_status}. "
         f"Chart readable {ctx.chart_readable}. "
-        f"Painel aberto {ctx.order_panel_open}. "
-        f"Popup {ctx.blocking_popup}."
+        f"Painel aviso {ctx.order_panel_open}. "
+        f"Popup aviso {ctx.blocking_popup}."
     )
 
     if ctx.warnings:
@@ -1387,10 +1363,8 @@ def build_short_message(decision: Dict[str, Any], img: ImageAnalysis) -> str:
         return "Estrutura ainda fraca"
     if action == "WAIT_ONE_MORE_CANDLE":
         return "Aguardar próxima vela"
-    if action == "WAIT_ORDER_PANEL":
-        return "Painel aberto, feche para analisar"
     if action == "DATA_INSUFFICIENT":
-        return "Sem dados mínimos"
+        return "Faltam ativo ou timeframe"
 
     if img.dominant_bias == "neutral":
         return "Mercado sem dominância clara"
@@ -1399,8 +1373,8 @@ def build_short_message(decision: Dict[str, Any], img: ImageAnalysis) -> str:
 
 
 def strength_label(img: ImageAnalysis, action: str) -> str:
-    if action in ("DATA_INSUFFICIENT", "WAIT_ORDER_PANEL"):
-        return "blocked"
+    if action == "DATA_INSUFFICIENT":
+        return "insufficient"
 
     s = img.strength_score
 
@@ -1415,14 +1389,8 @@ def strength_label(img: ImageAnalysis, action: str) -> str:
 
 
 def next_move_prediction(ctx: ParsedContext, img: ImageAnalysis) -> str:
-    if ctx.blocking_popup:
-        return "screen_blocked_no_prediction"
-
-    if ctx.order_panel_open:
-        return "order_panel_open_no_prediction"
-
-    if not ctx.chart_readable:
-        return "insufficient_data_no_prediction"
+    if not ctx.asset or not ctx.timeframe:
+        return "insufficient_context_no_prediction"
 
     if img.dominant_bias == "bullish":
         if img.continuation_health >= 0.58:
@@ -1438,22 +1406,16 @@ def next_move_prediction(ctx: ParsedContext, img: ImageAnalysis) -> str:
 
 
 def market_state(ctx: ParsedContext, img: ImageAnalysis) -> str:
-    if ctx.blocking_popup:
-        return "screen_blocked"
-
-    if ctx.order_panel_open:
-        return "order_panel_open"
-
-    if not ctx.chart_readable:
+    if not ctx.asset or not ctx.timeframe:
         return "insufficient_context"
 
-    if img.structural_weakness >= 0.66:
+    if img.structural_weakness >= 0.74:
         return "fragile_structure"
 
-    if img.fake_move_risk >= 0.70:
+    if img.fake_move_risk >= 0.76:
         return "fake_move_risk"
 
-    if img.reversal_pressure >= 0.70:
+    if img.reversal_pressure >= 0.78:
         return "reversal_pressure"
 
     if img.dominant_bias == "bullish":
@@ -1472,22 +1434,22 @@ def screen_quality(ctx: ParsedContext) -> float:
         score -= 0.25
 
     if ctx.order_panel_open:
-        score -= 0.45
+        score -= 0.06
 
     if ctx.blocking_popup:
-        score -= 0.55
+        score -= 0.06
 
     if not ctx.asset:
-        score -= 0.18
+        score -= 0.25
 
     if not ctx.current_price_raw:
-        score -= 0.20
+        score -= 0.06
 
     if not ctx.timeframe:
-        score -= 0.18
+        score -= 0.25
 
     if ctx.candle_time_remaining_sec is None:
-        score -= 0.08
+        score -= 0.06
 
     return clamp(score, 0.0, 1.0)
 
@@ -1496,13 +1458,13 @@ def context_reliability(ctx: ParsedContext) -> float:
     score = 0.0
 
     if ctx.asset:
-        score += 0.22
-
-    if ctx.current_price_raw:
         score += 0.26
 
+    if ctx.current_price_raw:
+        score += 0.18
+
     if ctx.timeframe:
-        score += 0.22
+        score += 0.26
 
     if ctx.candle_time_remaining_sec is not None:
         score += 0.18
@@ -1511,10 +1473,10 @@ def context_reliability(ctx: ParsedContext) -> float:
         score += 0.08
 
     if ctx.order_panel_open:
-        score -= 0.30
+        score -= 0.03
 
     if ctx.blocking_popup:
-        score -= 0.40
+        score -= 0.03
 
     return clamp(score, 0.0, 1.0)
 
@@ -1540,8 +1502,8 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     final_action = normalize_action(decision["action"])
 
-    if final_action in ("DATA_INSUFFICIENT", "WAIT_ORDER_PANEL"):
-        confidence = min(confidence, 25)
+    if final_action == "DATA_INSUFFICIENT":
+        confidence = min(confidence, 35)
         risk = "high"
 
     explanation = build_explanation(ctx, img, decision, timing, confidence, risk)
@@ -1549,6 +1511,8 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     sq = screen_quality(ctx)
     cr = context_reliability(ctx)
+
+    has_minimum_context = bool(ctx.asset and ctx.timeframe)
 
     return {
         "ok": True,
@@ -1591,8 +1555,8 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": confidence,
         "risk": risk,
 
-        "continuationProbability": decision["continuationProbability"] if ctx.chart_readable else 0,
-        "reversalProbability": decision["reversalProbability"] if ctx.chart_readable else 0,
+        "continuationProbability": decision["continuationProbability"] if has_minimum_context else 0,
+        "reversalProbability": decision["reversalProbability"] if has_minimum_context else 0,
 
         "primaryTrend": decision["primaryTrend"],
         "microTrend": decision["microTrend"],
@@ -1611,7 +1575,7 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         "timingQuality": timing["timingQuality"],
         "idealEntryType": timing["idealEntryType"],
 
-        "continuationHealth": round(img.continuation_health if ctx.chart_readable else 0.0, 4),
+        "continuationHealth": round(img.continuation_health if has_minimum_context else 0.0, 4),
         "reversalPressure": round(img.reversal_pressure, 4),
         "structuralWeakness": round(img.structural_weakness, 4),
         "fakeMoveRisk": round(img.fake_move_risk, 4),
@@ -1637,6 +1601,7 @@ def build_response(payload: Dict[str, Any]) -> Dict[str, Any]:
             "payoutIgnored": True,
             "binaryBrokerMode": False,
             "chartBaseSec": ctx.chart_base_sec,
+            "noHardBlock": True,
         },
     }
 
@@ -1660,6 +1625,7 @@ async def root():
         "mode": "TRADINGVIEW_PAPER",
         "payoutIgnored": True,
         "binaryBrokerMode": False,
+        "noHardBlock": True,
     })
 
 
@@ -1677,6 +1643,7 @@ async def health():
         "mode": "TRADINGVIEW_PAPER",
         "payoutIgnored": True,
         "binaryBrokerMode": False,
+        "noHardBlock": True,
     }
 
 
@@ -1691,6 +1658,7 @@ async def ws_sinais(websocket: WebSocket):
         "serverTimestamp": now_iso(),
         "version": APP_VERSION,
         "mode": "TRADINGVIEW_PAPER",
+        "noHardBlock": True,
     }))
 
     try:
